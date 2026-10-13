@@ -167,12 +167,14 @@ program usrneko
 
   ! -------------------------------------------------------------------------- !
   ! Clean up the components
-  call neko_finalize(neko_case)
   call opt%free()
+  if (allocated(opt)) deallocate(opt)
   call prob%free()
   call des%free()
+  if (allocated(des)) deallocate(des)
+  call neko_field%free()
 
-  if (allocated(opt)) deallocate(opt)
+  call neko_finalize(neko_case)
 
   end program usrneko
 

@@ -54,14 +54,15 @@ module heat_compliance
   use device_math, only: device_copy, device_cmult, device_glsc2, device_col2, &
        device_cfill, device_subcol3
   use math, only: col2, cmult, copy, glsc2, glsum
-  use ax_product, only: ax_t, ax_helm_factory
+   use ax_product, only: ax_t, ax_helm_allocator
   use krylov, only: ksp_t, ksp_monitor_t, krylov_solver_factory
-  use precon, only: pc_t, precon_factory, precon_destroy
+   use precon, only: pc_t, precon_allocator
   use jacobi, only: jacobi_t
   use device_jacobi, only: device_jacobi_t
   use sx_jacobi, only: sx_jacobi_t
   use hsmg, only: hsmg_t
   use bc_list, only: bc_list_t
+   use scalar_bc_projector, only: scalar_bc_projector_t
   use zero_dirichlet, only: zero_dirichlet_t
   use profiler, only: profiler_start_region, profiler_end_region
   use gather_scatter, only: gs_t, GS_OP_ADD
@@ -84,6 +85,7 @@ module heat_compliance
      class(ksp_t), allocatable :: ksp
      class(pc_t), allocatable :: pc
      type(bc_list_t) :: bclst
+   type(scalar_bc_projector_t) :: bc_projector
      type(zero_dirichlet_t) :: bc_sink
      real(kind=rp) :: abstol = 1.0e-4_rp
      integer :: ksp_max_iter = 10000
@@ -213,18 +215,18 @@ contains
 
     ! Add this bc to the list used by Ax/KSP
     call this%bclst%append(this%bc_sink)
+   call this%bc_projector%mark(this%bclst)
 
     ! ------------------------------------------------------------------ !
     ! Helmholtz operator and Krylov solver
     ! ------------------------------------------------------------------ !
-    call ax_helm_factory(this%Ax, full_formulation = .false.)
+   call ax_helm_allocator(this%Ax, type_name = "standard")
 
     call krylov_solver_factory(this%ksp, n, this%ksp_solver, &
          this%ksp_max_iter, this%abstol)
 
     call heat_compliance_precon_factory(this%pc, this%ksp, &
-         this%coef, this%coef%dof, this%coef%gs_h, this%bclst, &
-         this%precon_type)
+          this%coef, this%coef%dof, this%coef%gs_h, this%precon_type)
 
     ! Temperature field and conductivity field
     call this%phi%init(this%coef%dof)
@@ -262,6 +264,7 @@ contains
     call this%free_base()
 
     if (allocated(this%Ax)) then
+       call this%Ax%free()
        deallocate(this%Ax)
     end if
 
@@ -271,11 +274,12 @@ contains
     end if
 
     if (allocated(this%pc)) then
-       call precon_destroy(this%pc)
+       call this%pc%free()
        deallocate(this%pc)
     end if
 
     call this%bc_sink%free()
+   call this%bc_projector%free()
     call this%mapping%free()
     call this%bclst%free()
     call this%phi%free()
@@ -349,7 +353,7 @@ contains
        call this%pc%update()
        this%ksp_results(1) = &
             this%ksp%solve(this%Ax, delta_phi, RHS%x, n, this%coef, &
-            this%bclst, this%coef%gs_h)
+           this%bc_projector, this%coef%gs_h)
        call profiler_end_region('Forward solve')
 
        ! add result
@@ -436,25 +440,24 @@ contains
   !=========================================================================!
   !  Preconditioner factory
   !=========================================================================!
-  subroutine heat_compliance_precon_factory(pc, ksp, coef, dof, gs, bclst, pctype)
+   subroutine heat_compliance_precon_factory(pc, ksp, coef, dof, gs, pctype)
     implicit none
     class(pc_t),   allocatable, target, intent(inout) :: pc
     class(ksp_t),  target,      intent(inout)         :: ksp
     type(coef_t),  target,      intent(in)            :: coef
     type(dofmap_t),target,      intent(in)            :: dof
     type(gs_t),    target,      intent(inout)         :: gs
-    type(bc_list_t),target,     intent(inout)         :: bclst
     character(len=*),           intent(in)            :: pctype
 
-    call precon_factory(pc, pctype)
+    call precon_allocator(pc, pctype)
 
     select type (pcp => pc)
     type is (jacobi_t)
-       call pcp%init(coef, dof, gs)
+       call pcp%init_from_components(coef, dof, gs)
     type is (sx_jacobi_t)
-       call pcp%init(coef, dof, gs)
+       call pcp%init_from_components(coef, dof, gs)
     type is (device_jacobi_t)
-       call pcp%init(coef, dof, gs)
+       call pcp%init_from_components(coef, dof, gs)
     end select
 
     call ksp%set_pc(pc)
