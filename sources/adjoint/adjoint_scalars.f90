@@ -212,6 +212,7 @@ contains
        call this%adjoint_scalar_fields(i)%init(msh, coef, gs, &
             json_subdict_adjoint, json_subdict_primal, numerics_params, &
             user, chkp, ulag, vlag, wlag, time_scheme, rho)
+       call this%adjoint_scalar_fields(i)%register_checkpoint(chkp)
     end do
   end subroutine adjoint_scalars_init
 
@@ -250,10 +251,6 @@ contains
     ! Allocate a single scalar field
     allocate(adjoint_scalar_pnpn_t::this%adjoint_scalar_fields(1))
 
-    ! The default for primal scalar name will be s, so we force these two
-    call params_adjoint%add('name', 's_adj')
-    call params_adjoint%add('primal_name', 's')
-
     ! TODO, there may be a corner case with multiple primal and a single adjoint
     ! we'll need to catch that before entering this subroutine.
 
@@ -261,6 +258,7 @@ contains
     call this%adjoint_scalar_fields(1)%init(msh, coef, gs, params_adjoint, &
          params_primal, numerics_params, user, chkp, ulag, vlag, wlag, &
          time_scheme, rho)
+    call this%adjoint_scalar_fields(1)%register_checkpoint(chkp)
   end subroutine adjoint_scalars_init_single
 
   !> Perform a time step for all scalar fields

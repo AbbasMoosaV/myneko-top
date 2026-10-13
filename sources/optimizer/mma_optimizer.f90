@@ -52,8 +52,9 @@ module mma_optimizer
   use math, only: abscmp
   use profiler, only: profiler_start_region, profiler_end_region
   use logger, only: neko_log
-  use vector_math, only: vector_cmult, vector_glmax, vector_glmin
   use matrix_math, only: matrix_cmult, matrix_glmax, matrix_glmin
+  use vector_math, only: vector_cmult, vector_absval, vector_sub2, &
+       vector_glmax, vector_glsubnorm, vector_glmin
   use device, only: device_memcpy, DEVICE_TO_HOST
   use scratch_registry, only: neko_scratch_registry
   use comm, only: pe_rank
@@ -286,11 +287,11 @@ contains
     class(design_t), intent(inout) :: design
     type(simulation_t), optional, intent(inout) :: simulation
 
-    type(vector_t), pointer :: x
+    type(vector_t), pointer :: x, x_old
     type(vector_t), pointer :: constraint_value
     type(vector_t), pointer :: objective_sensitivities
     type(matrix_t), pointer :: constraint_sensitivities
-    integer :: n_design, n_constraint, indices(4)
+    integer :: n_design, n_constraint, indices(5)
 
     logical :: converged
     real(kind=rp) :: maxobjsen, minobjsen, maxconsen, minconsen
@@ -300,11 +301,12 @@ contains
 
     ! Grab some local pointers
     call neko_scratch_registry%request(x, indices(1), n_design, .false.)
-    call neko_scratch_registry%request(constraint_value, indices(2), &
+    call neko_scratch_registry%request(x_old, indices(2), n_design, .false.)
+    call neko_scratch_registry%request(constraint_value, indices(3), &
          n_constraint, .false.)
-    call neko_scratch_registry%request(objective_sensitivities, indices(3), &
+    call neko_scratch_registry%request(objective_sensitivities, indices(4), &
          n_design, .false.)
-    call neko_scratch_registry%request(constraint_sensitivities, indices(4), &
+    call neko_scratch_registry%request(constraint_sensitivities, indices(5), &
          n_constraint, n_design, .false.)
 
     !  Retrieve the current objective and constraint values and sensitivities
@@ -346,6 +348,7 @@ contains
     end if
 
     ! Update the design variable
+    x_old = x
     call this%mma%update(iter, x, objective_sensitivities, &
          constraint_value, constraint_sensitivities)
     call design%update_design(x)
@@ -374,12 +377,30 @@ contains
        call problem%get_objective_sensitivities(objective_sensitivities)
     end select
 
+    ! Scale the constraints with the factor used in the update, such that they
+    ! are consistent with the multipliers of the scaled subproblem
+    if (.not. abscmp(this%scaling_factor, 1.0_rp)) then
+       call vector_cmult(constraint_value, this%scaling_factor)
+       call matrix_cmult(constraint_sensitivities, this%scaling_factor)
+    end if
+
     ! Check the KKT conditions and check for convergence
     call this%mma%KKT(x, objective_sensitivities, &
          constraint_value, constraint_sensitivities)
+
     converged = this%mma%get_residumax() .lt. this%tolerance
 
+    ! Compute L2 norm of design change
+    this%norm2_design_change = vector_glsubnorm(x, x_old)
+
+    ! Compute maximum absolute change
+    call vector_sub2(x_old, x)
+    call vector_absval(x_old)
+    this%max_design_change = vector_glmax(x_old)
+
     ! Free local resources
+    nullify(x, x_old, constraint_value, objective_sensitivities, &
+         constraint_sensitivities)
     call neko_scratch_registry%relinquish(indices)
 
   end function mma_optimizer_step

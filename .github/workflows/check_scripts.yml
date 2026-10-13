@@ -23,6 +23,12 @@ on:
         required: true
         type: string
 
+env:
+  # Set the default versions of the dependencies
+  JSON_FORTRAN_VERSION: ${{ inputs.json-fortran-version }}
+  NEKO_VERSION: ${{ inputs.neko-version }}
+  NEKO_TOP_VERSION: ${{ inputs.neko-top-version }}
+
 # ---------------------------------------------------------------------------- #
 # Define the jobs that will be run in this workflow. The jobs are run in a
 
@@ -50,7 +56,7 @@ jobs:
           version: 1.0
 
       - name: Setup non-cache dependencies
-        run: sudo apt-get install -y libopenblas-dev libopenmpi-dev
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev libopenmpi-dev
 
       - name: Setup python environment
         uses: actions/setup-python@v6
@@ -68,7 +74,7 @@ jobs:
       # ---------------------------------------------------------------------- #
 
       - name: Setup Neko-TOP
-        run: ./setup.sh --examples --test
+        run: ./setup.sh --examples --tests
 
       - name: Run TGV
         run: ./run.sh -nrc tgv
@@ -82,7 +88,10 @@ jobs:
           ./run.sh -rc rugby_ball
 
       - name: Run short tests
-        run: ./tests/test.sh mma unit
+        env:
+          OMP_NUM_THREADS: 1
+          NEKO_GS_COMM: "MPI"
+        run: ./tests/test.sh --procs 2 mma unit
 
       # ---------------------------------------------------------------------- #
       # Report errors if any step fails

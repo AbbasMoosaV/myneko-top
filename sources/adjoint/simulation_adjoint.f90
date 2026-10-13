@@ -45,6 +45,7 @@ module simulation_adjoint
   use time_state, only : time_state_t
   use time_step_controller, only: time_step_controller_t
   use adjoint_case, only: adjoint_case_t
+  use scratch_registry, only: neko_scratch_registry
   use device_math, only: device_glsc3
   use math, only: glsc3
   use vector, only: vector_t
@@ -252,8 +253,7 @@ contains
 
     call chkpf%init(trim(restart_file))
     call chkpf%read(C%fluid_adj%chkp)
-    C%time%dtlag = C%fluid_adj%chkp%dtlag
-    C%time%tlag = C%fluid_adj%chkp%tlag
+    call C%fluid_adj%chkp%set_time_state(C%time)
 
     ! Free the previous mesh, dont need it anymore
     do i = 1, size(C%time%dtlag)
@@ -266,7 +266,6 @@ contains
        call C%adjoint_scalars%restart(C%case%chkp)
     end if
 
-    C%time%t = real(C%case%fluid%chkp%restart_time(), kind=rp)
     call neko_log%section('Restarting from checkpoint')
     write(log_buf, '(A,A)') 'File :   ', trim(restart_file)
     call neko_log%message(log_buf)
@@ -283,9 +282,9 @@ contains
   subroutine simulation_adjoint_norm_output(C, time_output)
     type(adjoint_case_t), intent(inout) :: C
     type(time_state_t), intent(in) :: time_output
-    type(vector_t) :: data_line
+    type(vector_t), pointer :: data_line
     real(kind=rp) :: norm_l2
-    integer :: n
+    integer :: n, idx
 
     if (.not. C%norm_output_enabled) return
     if (.not. C%norm_output_ctrl%check(time_output)) return
@@ -309,11 +308,11 @@ contains
 
     norm_l2 = sqrt(norm_l2) / C%fluid_adj%c_Xh%volume
 
-    call data_line%init(1)
+    call neko_scratch_registry%request(data_line, idx, 1, .false.)
     data_line%x = [norm_l2]
     call C%norm_output_file%write(data_line, time_output%t)
-    call data_line%free()
-    call C%norm_output_ctrl%register_execution()
+    call neko_scratch_registry%relinquish(idx)
+    call C%norm_output_ctrl%register_execution(time_output)
   end subroutine simulation_adjoint_norm_output
 
   !> Write a checkpoint at joblimit

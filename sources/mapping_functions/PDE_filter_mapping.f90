@@ -33,16 +33,16 @@
 !! POSSIBILITY OF SUCH DAMAGE.
 !
 !> A PDE based filter
-module PDE_filter
+module PDE_filter_mapping
   use num_types, only: rp
   use json_module, only: json_file
   use registry, only: neko_registry
   use field, only: field_t
   use coefs, only: coef_t
-  use ax_product, only: ax_t, ax_helm_factory
+  use ax_product, only: ax_t, ax_helm_allocator
   use krylov, only: ksp_t, ksp_monitor_t, krylov_solver_factory
-  use precon, only: pc_t, precon_factory, precon_destroy
-  use bc_list, only: bc_list_t
+  use precon, only: pc_t, precon_allocator
+  use scalar_bc_projector, only: scalar_bc_projector_t
   use neumann, only: neumann_t
   use profiler, only: profiler_start_region, profiler_end_region
   use gather_scatter, only: gs_t, GS_OP_ADD
@@ -80,7 +80,7 @@ module PDE_filter
      !> Filter Preconditioner
      class(pc_t), allocatable :: pc_filt
      !> Filter boundary conditions (they will all be Neumann, so empty)
-     type(bc_list_t) :: bclst_filt
+     type(scalar_bc_projector_t) :: bc_projector_filt
 
      ! Inputs from the user
      !> filter radius
@@ -161,11 +161,8 @@ contains
     ! set the number of dofs
     n = this%coef%dof%size()
 
-    ! init the bc list (all Neuman BCs, will remain empty)
-    call this%bclst_filt%init()
-
     ! Setup backend dependent Ax routines
-    call ax_helm_factory(this%Ax, full_formulation = .false.)
+    call ax_helm_allocator(this%Ax, type_name = "standard")
 
     ! set up krylov solver
     call krylov_solver_factory(this%ksp_filt, n, this%ksp_solver, &
@@ -173,8 +170,8 @@ contains
 
     ! set up preconditioner
     call filter_precon_factory(this%pc_filt, this%ksp_filt, &
-         this%coef, this%coef%dof, this%coef%gs_h, this%bclst_filt, &
-         this%precon_type_filt)
+         this%coef, this%coef%dof, this%coef%gs_h, &
+         this%bc_projector_filt, this%precon_type_filt)
 
   end subroutine PDE_filter_init_from_attributes
 
@@ -192,11 +189,11 @@ contains
     end if
 
     if (allocated(this%pc_filt)) then
-       call precon_destroy(this%pc_filt)
+       call this%pc_filt%free()
        deallocate(this%pc_filt)
     end if
 
-    call this%bclst_filt%free()
+    call this%bc_projector_filt%free()
 
     call this%free_base()
 
@@ -241,6 +238,11 @@ contains
     end if
     this%coef%ifh2 = .true.
 
+    ! The Helmholtz coefficients above may have changed since the previous
+    ! application (or may not have been set when the preconditioner was
+    ! initialized). Update the preconditioner for the operator used below.
+    call this%pc_filt%update()
+
     ! compute the A(X_in) component of the RHS
     ! (note, to be safe with the inout intent we first copy X_in to the
     !  temporary d_X_out)
@@ -263,20 +265,18 @@ contains
     call this%coef%gs_h%op(RHS, GS_OP_ADD)
 
     ! set BCs
-    call this%bclst_filt%apply_scalar(RHS%x, n)
+    call this%bc_projector_filt%apply(RHS%x, n)
 
     ! Solve Helmholtz equation
     call profiler_start_region('filter solve')
     this%ksp_results(1) = &
          this%ksp_filt%solve(this%Ax, d_X_out, RHS%x, n, this%coef, &
-         this%bclst_filt, this%coef%gs_h)
+         this%bc_projector_filt, this%coef%gs_h)
 
     call profiler_end_region
 
     ! add result
     call field_add3(X_out, X_in, d_X_out)
-    ! update preconditioner (needed?)
-    call this%pc_filt%update()
 
     ! write it all out
     call neko_log%message('Filter')
@@ -340,6 +340,10 @@ contains
     end if
     this%coef%ifh2 = .true.
 
+    ! Keep the preconditioner synchronized with the Helmholtz operator used
+    ! for this application.
+    call this%pc_filt%update()
+
     ! compute the A(sens_in) component of the RHS
     ! (note, to be safe with the inout intent we first copy sens_in to the
     !  temporary delta)
@@ -362,21 +366,18 @@ contains
     call this%coef%gs_h%op(RHS, GS_OP_ADD)
 
     ! set BCs
-    call this%bclst_filt%apply_scalar(RHS%x, n)
+    call this%bc_projector_filt%apply(RHS%x, n)
 
     ! Solve Helmholtz equation
     call profiler_start_region('filter solve')
     this%ksp_results(1) = &
          this%ksp_filt%solve(this%Ax, delta, RHS%x, n, this%coef, &
-         this%bclst_filt, this%coef%gs_h)
+         this%bc_projector_filt, this%coef%gs_h)
 
     ! add result
     call field_add3(sens_out, sens_in, delta)
 
     call profiler_end_region
-
-    ! update preconditioner (needed?)
-    call this%pc_filt%update()
 
     ! write it all out
     call neko_log%message('Filter')
@@ -392,30 +393,30 @@ contains
 
   end subroutine PDE_filter_backward_mapping
 
-  subroutine filter_precon_factory(pc, ksp, coef, dof, gs, bclst, pctype)
-
-    implicit none
+  !> Initialize a Krylov preconditioner
+  subroutine filter_precon_factory(pc, ksp, coef, dof, gs, bc_projector, &
+       pctype)
     class(pc_t), allocatable, target, intent(inout) :: pc
     class(ksp_t), target, intent(inout) :: ksp
     type(coef_t), target, intent(in) :: coef
     type(dofmap_t), target, intent(in) :: dof
     type(gs_t), target, intent(inout) :: gs
-    type(bc_list_t), target, intent(inout) :: bclst
+    type(scalar_bc_projector_t), target, intent(inout) :: bc_projector
     character(len=*) :: pctype
 
-    call precon_factory(pc, pctype)
+    call precon_allocator(pc, pctype)
 
     select type (pcp => pc)
     type is (jacobi_t)
-       call pcp%init(coef, dof, gs)
+       call pcp%init_from_components(coef, dof, gs)
     type is (sx_jacobi_t)
-       call pcp%init(coef, dof, gs)
+       call pcp%init_from_components(coef, dof, gs)
     type is (device_jacobi_t)
-       call pcp%init(coef, dof, gs)
+       call pcp%init_from_components(coef, dof, gs)
     end select
 
     call ksp%set_pc(pc)
 
   end subroutine filter_precon_factory
 
-end module PDE_filter
+end module PDE_filter_mapping

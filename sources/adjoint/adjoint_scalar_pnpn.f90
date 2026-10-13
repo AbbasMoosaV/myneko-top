@@ -37,20 +37,21 @@
 module adjoint_scalar_pnpn
   use comm, only: NEKO_COMM
   use utils, only: neko_error
-  use num_types, only: rp
+  use num_types, only: rp, dp
   use, intrinsic :: iso_fortran_env, only: error_unit
   use rhs_maker, only : rhs_maker_bdf_t, rhs_maker_ext_t, rhs_maker_oifs_t, &
        rhs_maker_ext_fctry, rhs_maker_bdf_fctry, rhs_maker_oifs_fctry
   use adjoint_scalar_scheme, only : adjoint_scalar_scheme_t
+  use checkpoint_payload, only : checkpoint_payload_t
   use checkpoint, only : chkp_t
   use field, only : field_t
-  use bc_list, only : bc_list_t
+  use scalar_bc_projector, only : scalar_bc_projector_t
   use mesh, only : mesh_t
   use coefs, only : coef_t
   use device, only : HOST_TO_DEVICE, device_memcpy
   use gather_scatter, only : gs_t, GS_OP_ADD
   use scalar_residual, only : scalar_residual_t, scalar_residual_factory
-  use ax_product, only : ax_t, ax_helm_factory
+  use ax_product, only : ax_t, ax_helm_allocator
   use field_series, only: field_series_t
   use facet_normal, only : facet_normal_t
   use krylov, only : ksp_monitor_t
@@ -58,6 +59,7 @@ module adjoint_scalar_pnpn
   use time_scheme_controller, only : time_scheme_controller_t
   use projection, only : projection_t
   use math, only : glsc2, col2, add2s2
+  use field_math, only : field_col3, field_col2
   use logger, only : neko_log, LOG_SIZE, NEKO_LOG_DEBUG
   use advection_adjoint, only : advection_adjoint_t, advection_adjoint_factory
   use profiler, only : profiler_start_region, profiler_end_region
@@ -65,11 +67,10 @@ module adjoint_scalar_pnpn
   use json_module, only : json_file, json_core, json_value
   use user_intf, only : user_t
   use neko_config, only : NEKO_BCKND_DEVICE
-  use zero_dirichlet, only : zero_dirichlet_t
   use time_step_controller, only : time_step_controller_t
   use scratch_registry, only : neko_scratch_registry
   use time_state, only : time_state_t
-  use bc, only : bc_t
+  use bc, only : bc_t, BC_DIRICHLET
   use mpi_f08, only: MPI_INTEGER, MPI_SUM, MPI_MAX
   implicit none
   private
@@ -89,16 +90,8 @@ module adjoint_scalar_pnpn
      !> Solution projection.
      type(projection_t) :: proj_s
 
-     !> Dirichlet conditions for the residual
-     !! Collects all the Dirichlet condition facets into one bc and applies 0,
-     !! Since the values never change there during the solve.
-     type(zero_dirichlet_t) :: bc_res
-
-     !> A bc list for the bc_res. Contains only that, essentially just to wrap
-     !! the if statement determining whether to apply on the device or CPU.
-     !! Also needed since a bc_list is the type that is sent to, e.g. solvers,
-     !! cannot just send `bc_res` on its own.
-     type(bc_list_t) :: bclst_ds
+     !> Projector for the adjoint scalar increment constraints.
+     type(scalar_bc_projector_t) :: bc_projector
 
      !> Advection operator.
      class(advection_adjoint_t), allocatable :: adv
@@ -124,6 +117,9 @@ module adjoint_scalar_pnpn
    contains
      !> Constructor.
      procedure, pass(this) :: init => adjoint_scalar_pnpn_init
+     !> Register this scalar scheme with the checkpoint.
+     procedure, pass(this) :: register_checkpoint => &
+          adjoint_scalar_pnpn_register_checkpoint
      !> To restart
      procedure, pass(this) :: restart => adjoint_scalar_pnpn_restart
      !> Destructor.
@@ -145,8 +141,8 @@ module adjoint_scalar_pnpn
        class(bc_t), pointer, intent(inout) :: object
        type(adjoint_scalar_pnpn_t), intent(in) :: scheme
        type(json_file), intent(inout) :: json
-       type(coef_t), intent(in) :: coef
-       type(user_t), intent(in) :: user
+       type(coef_t), target, intent(in) :: coef
+       type(user_t), target, intent(in) :: user
      end subroutine adjoint_bc_factory
   end interface adjoint_bc_factory
 
@@ -187,6 +183,7 @@ contains
     class(bc_t), pointer :: bc_i
     character(len=15), parameter :: scheme = 'Modular (Pn/Pn)'
     logical :: advection
+    real(kind=dp), pointer :: tlag(:), dtlag(:)
 
     call this%free()
 
@@ -195,7 +192,7 @@ contains
          scheme, user, rho)
 
     ! Setup backend dependent Ax routines
-    call ax_helm_factory(this%ax, full_formulation = .false.)
+    call ax_helm_allocator(this%ax, type_name = "standard")
 
     ! Setup backend dependent scalar residual routines
     call scalar_residual_factory(this%res)
@@ -228,20 +225,13 @@ contains
     ! Set up boundary conditions
     call this%setup_bcs_(user)
 
-    ! Initialize dirichlet bcs for scalar residual
-    call this%bc_res%init(this%c_Xh, params_adjoint)
+    ! Collect the Dirichlet dofs of all bcs into the increment projector.
     do i = 1, this%bcs%size()
-       if (this%bcs%strong(i)) then
+       if (this%bcs%bc_type(i) .eq. BC_DIRICHLET) then
           bc_i => this%bcs%get(i)
-          call this%bc_res%mark_facets(bc_i%marked_facet)
+          call this%bc_projector%mark(bc_i)
        end if
     end do
-
-!    call this%bc_res%mark_zones_from_list('d_s', this%bc_labels)
-    call this%bc_res%finalize()
-
-    call this%bclst_ds%init()
-    call this%bclst_ds%append(this%bc_res)
 
 
     ! Initialize projection space
@@ -257,35 +247,53 @@ contains
     ! Initialize advection factory
     call json_get_or_default(params_adjoint, 'advection', advection, .true.)
 
+    call chkp%get_time_history(tlag, dtlag)
     call advection_adjoint_factory(this%adv, numerics_params, this%c_Xh, &
-         ulag, vlag, wlag, this%chkp%dtlag, &
-         this%chkp%tlag, time_scheme, .not. advection, &
+         ulag, vlag, wlag, dtlag, &
+         tlag, time_scheme, .not. advection, &
          this%s_adj_lag)
-    ! Add lagged term to checkpoint
-    ! @todo Init chkp object, note, adding 3 slags
-
-    ! Add scalar info to checkpoint
-    ! call this%chkp%add_scalar(this%s)
-    ! this%chkp%abs1 => this%abx1
-    ! this%chkp%abs2 => this%abx2
-    ! this%chkp%slag => this%slag
-
   end subroutine adjoint_scalar_pnpn_init
+
+  !> Register this scalar scheme with the checkpoint.
+  subroutine adjoint_scalar_pnpn_register_checkpoint(this, chkp)
+    class(adjoint_scalar_pnpn_t), target, intent(inout) :: this
+    type(chkp_t), intent(inout) :: chkp
+    type(checkpoint_payload_t), pointer :: payload
+
+    payload => chkp%add_payload("adjoint_scalars/" // trim(this%name))
+    call payload%add_field(this%s_adj)
+    call payload%add_series(this%s_adj_lag)
+    call payload%add_field(this%abx1)
+    call payload%add_field(this%abx2)
+
+  end subroutine adjoint_scalar_pnpn_register_checkpoint
 
   !> I envision the arguments to this func might need to be expanded
   subroutine adjoint_scalar_pnpn_restart(this, chkp)
     class(adjoint_scalar_pnpn_t), target, intent(inout) :: this
     type(chkp_t), intent(inout) :: chkp
-    real(kind=rp) :: dtlag(10), tlag(10)
+    logical :: interpolated
     integer :: n
-    dtlag = chkp%dtlag
-    tlag = chkp%tlag
 
     n = this%s_adj%dof%size()
 
-    call col2(this%s_adj%x, this%c_Xh%mult, n)
-    call col2(this%s_adj_lag%lf(1)%x, this%c_Xh%mult, n)
-    call col2(this%s_adj_lag%lf(2)%x, this%c_Xh%mult, n)
+    ! Lag fields are restored through the checkpoint's fsp mechanism
+
+    ! The restored fields are continuous unless the checkpoint was written
+    ! on another mesh or at another polynomial order and was interpolated
+    ! on the way in. Only then do the copies of a node shared between
+    ! elements need averaging: scale by the inverse multiplicity, then sum
+    ! the copies with a gather-scatter. On a plain restart that is the
+    ! identity in exact arithmetic but not in floating point, and would put
+    ! about one ulp of error on every shared node. Same guard as the fluid.
+    interpolated = allocated(chkp%previous_mesh%elements) .or. &
+         chkp%previous_Xh%lx .ne. this%Xh%lx
+
+    if (interpolated) then
+       call col2(this%s_adj%x, this%c_Xh%mult, n)
+       call col2(this%s_adj_lag%lf(1)%x, this%c_Xh%mult, n)
+       call col2(this%s_adj_lag%lf(2)%x, this%c_Xh%mult, n)
+    end if
     if (NEKO_BCKND_DEVICE .eq. 1) then
        call device_memcpy(this%s_adj%x, this%s_adj%x_d, &
             n, HOST_TO_DEVICE, sync = .false.)
@@ -301,9 +309,11 @@ contains
             n, HOST_TO_DEVICE, sync = .false.)
     end if
 
-    call this%gs_Xh%op(this%s_adj, GS_OP_ADD)
-    call this%gs_Xh%op(this%s_adj_lag%lf(1), GS_OP_ADD)
-    call this%gs_Xh%op(this%s_adj_lag%lf(2), GS_OP_ADD)
+    if (interpolated) then
+       call this%gs_Xh%op(this%s_adj, GS_OP_ADD)
+       call this%gs_Xh%op(this%s_adj_lag%lf(1), GS_OP_ADD)
+       call this%gs_Xh%op(this%s_adj_lag%lf(2), GS_OP_ADD)
+    end if
 
   end subroutine adjoint_scalar_pnpn_restart
 
@@ -313,7 +323,7 @@ contains
     !Deallocate scalar field
     call this%scheme_free()
 
-    call this%bclst_ds%free()
+    call this%bc_projector%free()
     call this%proj_s%free()
 
     call this%s_adj_res%free()
@@ -354,12 +364,15 @@ contains
     type(time_scheme_controller_t), intent(in) :: ext_bdf
     type(time_step_controller_t), intent(in) :: dt_controller
     type(ksp_monitor_t), intent(inout) :: ksp_results
+    type(field_t), pointer :: rho_cp
+    integer :: rho_cp_index
     ! Number of degrees of freedom
     integer :: n
 
     if (this%freeze) return
 
     n = this%dm_Xh%size()
+    call neko_scratch_registry%request_field(rho_cp, rho_cp_index, .false.)
 
     call profiler_start_region('Adjoint Scalar')
     associate(u => this%u, v => this%v, w => this%w, s_adj => this%s_adj, &
@@ -376,11 +389,19 @@ contains
 
       ! Logs extra information the log level is NEKO_LOG_DEBUG or above.
       call print_debug(this)
-      ! Compute the source terms
-      call this%source_term%compute(time)
 
-      ! Apply weak boundary conditions, that contribute to the source terms.
-      call this%bcs%apply_scalar(this%f_Xh%x, dm_Xh%size(), time, .false.)
+      ! Update material properties and their pointwise product.
+      ! This MUST happen before rho_cp is used below (by makebdf and by the
+      ! source/advection scaling). It used to sit after those uses, which left
+      ! makebdf reading an uninitialised scratch field while res%compute used
+      ! the correct value -- so the BDF mass terms could not cancel at steady
+      ! state and the converged adjoint scalar came out proportional to dt.
+      ! Mirrors the ordering in Neko's forward scalar_pnpn.
+      call this%update_material_properties(time)
+      call field_col3(rho_cp, rho, cp)
+
+      ! Compute the source terms that are extrapolated in time below
+      call this%source_term%compute(time, extrapolate = .true.)
 
       ! if (oifs) then
       !    call neko_error("oifs not implemented for adjoint scalar")
@@ -397,18 +418,34 @@ contains
       call this%adv%compute_adjoint_scalar(u, v, w, s_adj, f_Xh, &
            Xh, this%c_Xh, dm_Xh%size())
 
+      ! Scale the volumetric source and advection terms by rho * cp, then add
+      ! the weak boundary fluxes without that scaling -- same split as the
+      ! forward scalar. (The weak BC application was previously done before
+      ! the advection term and never scaled, so it could not follow this
+      ! convention.)
+      call field_col2(f_Xh, rho_cp)
+
+      ! Apply weak boundary conditions, that contribute to the source terms.
+      call this%bcs%apply_scalar(this%f_Xh%x, dm_Xh%size(), time, .false.)
+
       ! At this point the RHS contains the sum of the advection operator,
       ! Neumann boundary sources and additional source terms, evaluated using
       ! the scalar field from the previous time-step.
       ! Now, this value is used in the explicit time scheme to advance these
       ! terms in time.
       call makeext%compute_scalar(this%abx1, this%abx2, f_Xh%x, &
-           rho%x(1,1,1,1), ext_bdf%advection_coeffs%x, n)
+           ext_bdf%advection_coeffs%x, n)
 
       ! Add the RHS contributions coming from the BDF scheme.
       call makebdf%compute_scalar(s_adj_lag, f_Xh%x, s_adj, c_Xh%B, &
-           rho%x(1,1,1,1), dt, ext_bdf%diffusion_coeffs%x, ext_bdf%ndiff, n)
+           rho_cp, dt, ext_bdf%diffusion_coeffs%x, ext_bdf%ndiff, n)
       ! end if
+
+      ! Source terms that must not be extrapolated in time are added as
+      ! computed, weighted by the mass matrix and rho * cp like the
+      ! extrapolated terms above.
+      call this%source_term%compute(time, extrapolate = .false., &
+           scale = rho_cp)
 
       call s_adj_lag%update()
 
@@ -416,20 +453,17 @@ contains
       call this%bcs%apply_scalar(this%s_adj%x, this%dm_Xh%size(), time, &
            .true.)
 
-      ! Update material properties if necessary
-      call this%update_material_properties(time)
-
       ! Compute scalar residual.
       call profiler_start_region('Adjoint_scalar_residual')
       call res%compute(Ax, s_adj, s_adj_res, f_Xh, c_Xh, msh, Xh, &
-           lambda, rho%x(1,1,1,1)*cp%x(1,1,1,1), ext_bdf%diffusion_coeffs%x(1), &
+           lambda, rho_cp, ext_bdf%diffusion_coeffs%x(1), &
            dt, dm_Xh%size())
 
       call gs_Xh%op(s_adj_res, GS_OP_ADD)
 
 
-      ! Apply a 0-valued Dirichlet boundary conditions on the ds_adj.
-      call this%bclst_ds%apply_scalar(s_adj_res%x, dm_Xh%size())
+      ! Zero-out residual at Dirichlet nodes before solving.
+      call this%bc_projector%apply(s_adj_res%x, dm_Xh%size())
 
       call profiler_end_region('Adjoint_scalar_residual')
 
@@ -438,13 +472,13 @@ contains
       call this%pc%update()
       call profiler_start_region('Adjoint_scalar_solve')
       ksp_results = this%ksp%solve(Ax, ds_adj, s_adj_res%x, n, &
-           c_Xh, this%bclst_ds, gs_Xh)
+           c_Xh, this%bc_projector, gs_Xh)
       call profiler_end_region('Adjoint_scalar_solve')
 
       ksp_results%name = 'Adjoint Scalar'
 
-      call this%proj_s%post_solving(ds_adj%x, Ax, c_Xh, this%bclst_ds, gs_Xh, &
-           n, tstep, dt_controller)
+      call this%proj_s%post_solving(ds_adj%x, Ax, c_Xh, this%bc_projector, &
+           gs_Xh, n, tstep, dt_controller)
 
       ! Update the solution
       if (NEKO_BCKND_DEVICE .eq. 1) then
@@ -454,6 +488,7 @@ contains
       end if
 
     end associate
+    call neko_scratch_registry%relinquish_field(rho_cp_index)
     call profiler_end_region('Adjoint Scalar')
   end subroutine adjoint_scalar_pnpn_step
 
@@ -479,7 +514,7 @@ contains
   !! @param[inout] this The this.
   !! @param user The user object binding the user-defined routines.
   subroutine adjoint_scalar_pnpn_setup_bcs_(this, user)
-    class(adjoint_scalar_pnpn_t), intent(inout) :: this
+    class(adjoint_scalar_pnpn_t), target, intent(inout) :: this
     type(user_t), target, intent(in) :: user
     integer :: i, j, n_bcs, zone_size, global_zone_size, ierr
     type(json_core) :: core

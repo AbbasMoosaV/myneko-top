@@ -37,13 +37,12 @@ function check_system_dependencies() {
 # ============================================================================ #
 # Ensure JSON-Fortran is installed, if not install it.
 function find_json_fortran() {
-    check_external_dir
+    check_environment
 
     # Determine the JSON-Fortran installation directory
-    if [[ $# -ge 1 ]]; then
-        JSON_FORTRAN_DIR="$(realpath $1)"
-    elif [ -z "$JSON_FORTRAN_DIR" ]; then
-        JSON_FORTRAN_DIR="$(realpath $EXTERNAL_DIR/json-fortran)"
+    JSON_FORTRAN_DIR=${JSON_FORTRAN_DIR:-"json-fortran"}
+    if [ "${JSON_FORTRAN_DIR:0:1}" != "/" ]; then
+        JSON_FORTRAN_DIR="$EXTERNAL_DIR/$JSON_FORTRAN_DIR"
     fi
 
     # Ensure JSON-Fortran is installed, if not install it.
@@ -53,8 +52,6 @@ function find_json_fortran() {
 
         # Clone JSON-Fortran from the repository if it does not exist.
         if [[ ! -d "$JSON_FORTRAN_DIR" || $(ls -A $JSON_FORTRAN_DIR | wc -l) -eq 0 ]]; then
-            [ -z "$JSON_FORTRAN_VERSION" ] && JSON_FORTRAN_VERSION="master"
-
             git clone --depth=1 --branch $JSON_FORTRAN_VERSION \
                 https://github.com/jacobwilliams/json-fortran $JSON_FORTRAN_DIR
         fi
@@ -93,23 +90,16 @@ function find_json_fortran() {
 # ============================================================================ #
 # Ensure Nek5000 is installed, if not install it.
 function find_nek5000() {
-    check_external_dir
+    check_environment
 
     # Determine the Nek5000 installation directory
-    if [[ $# -ge 1 ]]; then
-        if [[ "${1:0:1}" != "/" && "${1:0:1}" != "~" ]]; then
-            NEK5000_DIR="$(realpath $EXTERNAL_DIR/$1)"
-        else
-            NEK5000_DIR="$(realpath $1)"
-        fi
-    else
-        export NEK5000_DIR=""
+    if [ -z "$NEK5000_DIR" ]; then
         return
+    elif [ "${NEK5000_DIR:0:1}" != "/" ]; then
+        NEK5000_DIR="$EXTERNAL_DIR/$NEK5000_DIR"
     fi
 
     if [[ ! -d "$NEK5000_DIR" || $(ls -A $NEK5000_DIR | wc -l) -eq 0 ]]; then
-        [ -z "$NEK5000_VERSION" ] && NEK5000_VERSION="master"
-
         git clone --depth 1 --branch $NEK5000_VERSION \
             https://github.com/Nek5000/Nek5000.git $NEK5000_DIR
     fi
@@ -118,18 +108,13 @@ function find_nek5000() {
 # ============================================================================ #
 # Ensure GSLIB is installed, if not install it.
 function find_gslib() {
-    check_external_dir
+    check_environment
 
     # Determine the GSLib installation directory
-    if [[ $# -ge 1 ]]; then
-        if [[ "${1:0:1}" != "/" && "${1:0:1}" != "~" ]]; then
-            GSLIB_DIR="$(realpath $EXTERNAL_DIR/$1)"
-        else
-            GSLIB_DIR="$(realpath $1)"
-        fi
-    else
-        export GSLIB_DIR=""
+    if [ -z "$GSLIB_DIR" ]; then
         return
+    elif [ "${GSLIB_DIR:0:1}" != "/" ]; then
+        GSLIB_DIR="$EXTERNAL_DIR/$GSLIB_DIR"
     fi
 
     # Ensure GSLIB is installed, if not install it.
@@ -176,19 +161,17 @@ function find_gslib() {
 # ============================================================================ #
 # Ensure PFUnit is installed, if not install it.
 function find_pfunit() {
-    check_external_dir
+    check_environment
 
     # Determine the pFUnit installation directory
-    if [[ $# -ge 1 ]]; then
-        PFUNIT_DIR="$(realpath $1)"
-    elif [ -z "$PFUNIT_DIR" ]; then
-        PFUNIT_DIR="$(realpath $EXTERNAL_DIR/pfunit)"
+    if [ -z "$PFUNIT_DIR" ]; then
+        return
+    elif [ "${PFUNIT_DIR:0:1}" != "/" ]; then
+        PFUNIT_DIR="$EXTERNAL_DIR/$PFUNIT_DIR"
     fi
 
     # Clone pFUnit from the repository if it does not exist.
     if [[ ! -d "$PFUNIT_DIR" || $(ls -A $PFUNIT_DIR | wc -l) -eq 0 ]]; then
-        [ -z "$PFUNIT_VERSION" ] && PFUNIT_VERSION="v4.12.0"
-
         git clone --depth=1 --branch $PFUNIT_VERSION \
             https://github.com/Goddard-Fortran-Ecosystem/pFUnit.git $PFUNIT_DIR
 
@@ -209,15 +192,15 @@ index 7df7b65..4f7dbf5 100644
  #endif
        end if
 _ACEOF
-        git apply pfunit_error_stop.patch
+        if git apply --check pfunit_error_stop.patch 2>/dev/null; then
+            git apply pfunit_error_stop.patch
+        fi
         cd $CURRENT_DIR
     fi
 
     if [[ -z "$(find $PFUNIT_DIR -name libpfunit.a)" ]]; then
-        cmake -B $PFUNIT_DIR/build -S $PFUNIT_DIR -G "Unix Makefiles" \
-            -DCMAKE_INSTALL_PREFIX=$PFUNIT_DIR \
-            -DCMAKE_C_COMPILER=$CC \
-            -DCMAKE_Fortran_COMPILER=$FC
+        cmake -B $PFUNIT_DIR/build -S $PFUNIT_DIR -Wno-dev \
+            --install-prefix=$PFUNIT_DIR -DCMAKE_BUILD_TYPE=Release -DMPI=YES
         cmake --build $PFUNIT_DIR/build
         cmake --install $PFUNIT_DIR/build
     fi
@@ -241,56 +224,66 @@ _ACEOF
 # Ensure HDF5 is installed, if not install it.
 function find_hdf5() {
 
-    # Determine the HDF5 installation directory
-    check_external_dir
-    if [[ $# -ge 1 ]]; then
-        HDF5_DIR="$1"
-    elif [ -z "$HDF5_DIR" ]; then
-        return
-    fi
+    check_environment
 
-    if [[ "${HDF5_DIR:0:1}" != "/" && "${HDF5_DIR:0:1}" != "~" ]]; then
-        HDF5_DIR="$(realpath $EXTERNAL_DIR/$HDF5_DIR)"
+    # Determine the HDF5 installation directory. HDF5_ROOT is the name CMake
+    # and the module systems use; HDF5_DIR is accepted as a legacy spelling.
+    HDF5_ROOT=${HDF5_ROOT:-$HDF5_DIR}
+    if [ -z "$HDF5_ROOT" ]; then
+        return
+    elif [ "${HDF5_ROOT:0:1}" != "/" ]; then
+        HDF5_ROOT="$EXTERNAL_DIR/$HDF5_ROOT"
     fi
 
     # Ensure HDF5 is installed, if not install it.
-    HDF5_LIB=$(find $HDF5_DIR -type d -name 'lib*' \
+    HDF5_LIB=$(find "$HDF5_ROOT" -type d -name 'lib*' \
         -exec test -f '{}'/libhdf5_fortran.so \; -print 2>/dev/null) || true
     if [[ ! -d "$HDF5_LIB" ]]; then
 
+        # Never try to build into a read-only prefix, such as one provided by
+        # a module system.
+        if [[ -d "$HDF5_ROOT" && ! -w "$HDF5_ROOT" ]]; then
+            error "HDF5 not found under the read-only prefix:"
+            error "\t$HDF5_ROOT"
+            error "It looks module-provided. Load a module that supplies the"
+            error "Fortran bindings, or set HDF5_ROOT to a writable path to"
+            error "have one built there."
+            exit 1
+        fi
+
         # Clone HDF5 from the repository if it does not exist.
-        if [ ! -d "$HDF5_DIR" ]; then
-            [ -z "$HDF5_VERSION" ] && HDF5_VERSION="hdf5_2.0.0"
+        if [[ ! -d "$HDF5_ROOT" || $(ls -A $HDF5_ROOT | wc -l) -eq 0 ]]; then
             git clone --depth 1 --branch $HDF5_VERSION \
-                https://github.com/HDFGroup/hdf5.git $HDF5_DIR
+                https://github.com/HDFGroup/hdf5.git $HDF5_ROOT
         fi
 
         # Build and install HDF5
-        cmake -B $HDF5_DIR/build -S $HDF5_DIR \
-            --install-prefix $HDF5_DIR -DCMAKE_BUILD_TYPE=Release \
+        cmake -B $HDF5_ROOT/build -S $HDF5_ROOT --install-prefix $HDF5_ROOT \
+            -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER=$MPICC -DCMAKE_CXX_COMPILER=$MPICXX \
             -DCMAKE_Fortran_COMPILER=$MPIFC -DHDF5_ENABLE_PARALLEL=ON \
             -DHDF5_BUILD_FORTRAN=ON -DHDF5_ENABLE_SZIP_SUPPORT:BOOL=OFF \
             -DHDF5_BUILD_TOOLS:BOOL=ON
-        cmake --build $HDF5_DIR/build/ --config Release --parallel
-        cmake --install $HDF5_DIR/build/ --config Release
-        rm -fr $HDF5_DIR/build
+        cmake --build $HDF5_ROOT/build/ --config Release --parallel
+        cmake --install $HDF5_ROOT/build/ --config Release
+        rm -fr $HDF5_ROOT/build
     fi
 
     # Add HDF5 to the environment variables
-    HDF5_LIB=$(find $HDF5_DIR -type d -name 'lib*' \
+    HDF5_LIB=$(find "$HDF5_ROOT" -type d -name 'lib*' \
         -exec test -f '{}'/libhdf5_fortran.so \; -print 2>/dev/null) || true
-    if [ -z "$HDF5_LIB" ]; then
+    if [[ ! -d "$HDF5_LIB" ]]; then
         error "HDF5 not found at:"
-        error "\t$HDF5_DIR"
-        error "Please set HDF5_DIR to the directory containing"
-        error "the HDF5 source code."
+        error "\t$HDF5_ROOT"
+        error "Please set HDF5_ROOT to the directory containing"
+        error "the HDF5 installation."
         error "You can download the source code from:"
         error "\thttps://github.com/HDFGroup/hdf5.git"
         exit 1
     fi
 
-    export HDF5_DIR=$(realpath $HDF5_LIB/../)
+    export HDF5_ROOT=$(realpath $HDF5_LIB/../)
+    export HDF5_DIR=$HDF5_ROOT
     export LD_LIBRARY_PATH="$HDF5_LIB:$LD_LIBRARY_PATH"
     export PKG_CONFIG_PATH="$HDF5_LIB/pkgconfig:$PKG_CONFIG_PATH"
 }
@@ -301,17 +294,12 @@ function find_hdf5() {
 function find_parmetis() {
     echo "Skipping ParMETIS setup..."
     return 0
+    check_environment
 
     # Determine the Parmetis installation directory
-    check_external_dir
-    if [[ $# -ge 1 ]]; then
-        PARMETIS_DIR="$1"
-    elif [ -z "$PARMETIS_DIR" ]; then
-        PARMETIS_DIR="parmetis"
-    fi
-
-    if [[ "${PARMETIS_DIR:0:1}" != "/" && "${PARMETIS_DIR:0:1}" != "~" ]]; then
-        PARMETIS_DIR="$(realpath $EXTERNAL_DIR/$PARMETIS_DIR)"
+    PARMETIS_DIR=${PARMETIS_DIR:-"parmetis"}
+    if [[ "${PARMETIS_DIR:0:1}" != "/" ]]; then
+        PARMETIS_DIR="$EXTERNAL_DIR/$PARMETIS_DIR"
     fi
 
     if [[ -z "$(find $PARMETIS_DIR -name libparmetis.a)" ]]; then
@@ -324,6 +312,12 @@ function find_parmetis() {
         wget https://github.com/mfem/tpls/raw/refs/heads/gh-pages/parmetis-4.0.3.tar.gz
         tar xzf parmetis-4.0.3.tar.gz
         cd parmetis-4.0.3
+
+        # Modify the minimum requirement of cmake
+        cmake_lists=$(find . -name CMakeLists.txt)
+        for file in $cmake_lists; do
+            sed -i 's/cmake_minimum_required(VERSION 2.8)/cmake_minimum_required(VERSION 3.11)/g' $file
+        done
 
         # Compile the bundled metis library
         cd metis
@@ -358,33 +352,50 @@ function find_parmetis() {
 # ============================================================================ #
 # Ensure Neko is installed, if not install it.
 function find_neko() {
-    check_external_dir
+    check_environment
 
     # Find the required dependencies for Neko
-    find_json_fortran $JSON_FORTRAN_DIR
-    find_gslib $GSLIB_DIR
-    find_hdf5 $HDF5_DIR
-    find_parmetis $PARMETIS_DIR
-    [ "$NEKO_TEST" == true ] && find_pfunit $PFUNIT_DIR
+    find_json_fortran
+    find_gslib
+    find_hdf5
+    find_parmetis
+    [ -n "$PFUNIT_DIR" ] && find_pfunit
 
     # Determine the Neko installation directory
-    if [[ $# -ge 1 ]]; then
-        NEKO_DIR="$(realpath $1)"
-    elif [ -z "$NEKO_DIR" ]; then
-        NEKO_DIR="$(realpath $EXTERNAL_DIR/neko)"
+    NEKO_DIR=${NEKO_DIR:-"neko"}
+    if [ "${NEKO_DIR:0:1}" != "/" ]; then
+        NEKO_DIR="$EXTERNAL_DIR/$NEKO_DIR"
     fi
 
     # Check if Neko is installed, if not install it.
-    NEKO_LIB=$(find $NEKO_DIR -type d -name 'lib*' \
+    NEKO_LIB=$(find $NEKO_DIR -type d -name 'lib*' -maxdepth 1 \
         -exec test -f '{}'/libneko.a \; -print 2>/dev/null) || true
-    if [[ ! -d "$NEKO_LIB" || "$CLEAN_NEKO" == true ]]; then
+
+    if [[ $# -ge 1 ]]; then
+        if [[ -d "$NEKO_LIB" && ! -f "$NEKO_DIR/configure.ac" ]]; then
+            BUILD_NEKO="false"
+        elif [ "$1" == "--build" ]; then
+            BUILD_NEKO="true"
+        fi
+    fi
+
+    # Build neko if requested.
+    if [[ "$BUILD_NEKO" == true ]]; then
 
         # Clone Neko from the repository if it does not exist.
         if [[ ! -d "$NEKO_DIR" || $(ls -A $NEKO_DIR | wc -l) -eq 0 ]]; then
-            [ -z "$NEKO_VERSION" ] && NEKO_VERSION="neko-top"
-
             git clone --depth 1 --branch $NEKO_VERSION \
                 https://github.com/ExtremeFLOW/neko.git $NEKO_DIR
+        fi
+
+        # Apply Cray-specific patches before building on Cray systems
+        if [[ -n "${CRAYPE_VERSION:-}" || "${PE_ENV:-}" == "CRAY" || -d "/opt/cray" ]]; then
+            cray_patches=($(find $NEKO_DIR/patches/ -name 'cce_*.patch' -type f))
+            for patch in "${cray_patches[@]}"; do
+                if git -C "$NEKO_DIR" apply --check "$patch" 2>/dev/null; then
+                    git -C "$NEKO_DIR" apply "$patch"
+                fi
+            done
         fi
 
         # Determine available features
@@ -393,7 +404,7 @@ function find_neko() {
         [ -n "$BLAS_DIR" ] && FEATURES+=" --with-blas=$BLAS_DIR"
         [ -n "$HDF5_DIR" ] && FEATURES+=" --with-hdf5=$HDF5_DIR"
         [ -n "$PARMETIS_DIR" ] && FEATURES+=" --with-parmetis=$PARMETIS_DIR"
-        [ "$NEKO_TEST" == true ] && FEATURES+=" --with-pfunit=$PFUNIT_DIR"
+        [ -n "$PFUNIT_DIR" ] && FEATURES+=" --with-pfunit=$PFUNIT_DIR"
 
         # Handle device specific features
         if [ "$DEVICE_TYPE" == "CUDA" ]; then
@@ -405,6 +416,16 @@ function find_neko() {
                 error "the CUDA installation."
                 exit 1
             fi
+
+            if [ -n "$NEKO_CUDA_ARCH" ]; then
+                FEATURES+=" CUDA_ARCH=$NEKO_CUDA_ARCH"
+            elif [ -n "$CUDA_ARCH" ]; then
+                FEATURES+=" CUDA_ARCH=-arch=sm_$CUDA_ARCH"
+            else
+                error "CUDA architecture not set."
+                exit 1
+            fi
+
         elif [ "$DEVICE_TYPE" == "HIP" ]; then
             if [ -d "$HIP_DIR" ]; then
                 FEATURES+=" --with-hip=$HIP_DIR"
@@ -454,13 +475,22 @@ function find_neko() {
         make install
 
         cd $CURRENT_DIR
+
+        # Revert the patches to keep the repository clean
+        if [[ -n "${CRAYPE_VERSION:-}" || "${PE_ENV:-}" == "CRAY" || -d "/opt/cray" ]]; then
+            for patch in "${cray_patches[@]}"; do
+                if git -C "$NEKO_DIR" apply --reverse --check "$patch" 2>/dev/null; then
+                    git -C "$NEKO_DIR" apply --reverse "$patch"
+                fi
+            done
+        fi
     fi
 
-    NEKO_LIB=$(find $NEKO_DIR -type d -name 'lib*' \
+    NEKO_LIB=$(find $NEKO_DIR -type d -name 'lib*' -maxdepth 1 \
         -exec test -f '{}'/libneko.a \; -print 2>/dev/null) || true
     if [ ! -d "$NEKO_LIB" ]; then
         error "Neko not found at:"
-        error "\$tNEKO_DIR"
+        error "\t$NEKO_DIR"
         error "Please set NEKO_DIR to the directory containing"
         error "the Neko source code."
         error "You can download the source code from:"
@@ -509,7 +539,7 @@ function find_cubit() {
 # ============================================================================ #
 # Ensure ExodusII to Nek5000 is installed, if not install it.
 function find_exo2nek() {
-    find_nek5000 $NEK5000_DIR
+    find_nek5000
 
     # Check if exo2nek is available
     if command -v exo2nek 2>&1 1>/dev/null; then
@@ -535,8 +565,8 @@ function find_exo2nek() {
 # ============================================================================ #
 # Ensure Rea2Nbin is installed.
 function find_rea2nbin() {
-    find_json_fortran $JSON_FORTRAN_DIR
-    find_hdf5 $HDF5_DIR
+    find_json_fortran
+    find_hdf5
 
     # Check if rea2nbin is available
     if command -v rea2nbin 2>&1 1>/dev/null; then
@@ -590,13 +620,11 @@ function error() {
     echo -e "$1" >&2
 }
 
-function check_external_dir() {
-    if [ -z "$EXTERNAL_DIR" ]; then
-        echo "Environment EXTERNAL_DIR is not set."
-        echo "Default path will be used: ~/tmp/external"
-        export EXTERNAL_DIR=$(realpath ~/tmp/external)
-    fi
+function check_environment() {
+    # Check the main directory and source the dependency versions file
+    export MAIN_DIR=${MAIN_DIR:-$(realpath $(dirname $0)/../)}
+    export EXTERNAL_DIR=${EXTERNAL_DIR:-$HOME/tmp/external}
 
+    source $MAIN_DIR/config/dependency-versions.env
     mkdir -p $EXTERNAL_DIR
-
 }
