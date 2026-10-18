@@ -238,3 +238,7 @@ jobs:
     name: Cleanup merge group caches
     needs: check_complete
     uses: ./.github/workflows/cleanup.yml
+    permissions:
+      contents: read
+      actions: write
+      pull-requests: read
