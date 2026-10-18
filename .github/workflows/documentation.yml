@@ -52,28 +52,3 @@ jobs:
           path: documentation/html/
 
   # -------------------------------------------------------------------------- #
-  # Deploy documentation job
-
-  deploy-docs:
-    name: Deploy
-    runs-on: ubuntu-latest
-
-    if: github.event_name == 'push' || github.event.pull_request.base.ref == 'main'
-    needs: build-docs
-
-    # Define the deployment environment
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-
-      # Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
-
-    # Define the deployment strategy
-    steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v5
