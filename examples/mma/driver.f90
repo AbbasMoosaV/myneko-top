@@ -56,7 +56,7 @@ program usrneko
   ! -------------------------------------------------------------------------- !
   ! Initialize the MPI environment
 
-  call MPI_Init(ierr)
+  !   call MPI_Init(ierr)
 
   ! -------------------------------------------------------------------------- !
   ! Read the parameters file as the first terminal argument
